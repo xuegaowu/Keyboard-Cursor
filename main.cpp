@@ -8,10 +8,12 @@
 //   3. 独立线程按固定节拍轮询这些原子变量，做决策并调用 SendInput/
 //      SetCursorPos 驱动鼠标。
 //   4. 用组合键（1~4 个键同时按下）作为"总开关"，边沿触发切换启用/禁用。
-//   5. 双存档体系：save0.ini 为隐式自动档（启动读、退出写），
-//      save1..N.ini 为显式档（下拉框选择、手动保存/加载）。
+//   5. 存档体系：save1..N.ini 是用户可选的存档槽；save0.ini 是"最后一次显式保存"
+//      的镜像（启动时读它恢复状态）。点"保存"时两个都写。
 //   6. 存档目录不可写时不再静默失败：可回退到用户目录，或降级为只读模式，
 //      并在窗口底部状态行如实显示当前状态。
+//   7. 草稿模型：界面上所有改动先进草稿，点"应用"才推进内存真正生效，
+//      点"保存"才落盘；退出时若有未保存的修改会询问是/否/取消。
 // ============================================================
 
 // 包含 Windows API 头文件
@@ -51,11 +53,11 @@
 
 using namespace std::chrono;
 
-// 控制线程的轮询周期（毫秒）。取值原则：略高于目标显示器刷新周期。
-//   6ms ≈ 167Hz，覆盖 144/165Hz；240Hz 屏改 4；60Hz 屏 8 都够。
-// 注意：MOVE_SPEED 的单位是"每 tick 像素数"，改这个值会等比改变手感，
-// 所以默认值按 6ms 标定，不再随显示器变化。
-constexpr int TICK_MS = 6;
+// 控制线程的刷新间隔（毫秒），界面上可改（"刷新间隔(ms)"）。
+// 取值原则：略高于目标显示器刷新周期。6ms ≈ 167Hz，覆盖 144/165Hz。
+// 注意：MOVE_SPEED 的单位是"每 tick 像素数"，改这个值会等比改变手感。
+constexpr int DEFAULT_TICK_MS = 6;   // 出厂默认，草稿和 ini 缺省值共用这一处
+std::atomic<int> TICK_MS(DEFAULT_TICK_MS);
 
 // ==================== 控件 ID ====================
 // 每个子控件在窗口内的唯一标识。数字随意但须保证不重复，
@@ -65,6 +67,7 @@ constexpr int TICK_MS = 6;
 #define ID_EDIT_WHEEL_INTERVAL  3003   // 滚轮间隔
 #define ID_EDIT_WHEEL_SPEED     3004   // 滚轮速度
 #define ID_EDIT_WHEEL_MUL       3005   // 滚轮加速
+#define ID_EDIT_TICK            3006   // 刷新间隔（毫秒）
 #define ID_BTN_KEY_UP           3011   // 上按键
 #define ID_BTN_KEY_DOWN         3012   // 下按键
 #define ID_BTN_KEY_LEFT         3013   // 左按键
@@ -79,12 +82,14 @@ constexpr int TICK_MS = 6;
 #define ID_BTN_SWITCH3          3023   // 开关键3
 #define ID_BTN_SWITCH4          3024   // 开关键4
 #define ID_BTN_CLEAR_SWITCH     3025   // 清空开关键
+#define ID_RADIO_SWITCH_TOGGLE  3026   // 组合键模式：按下切换
+#define ID_RADIO_SWITCH_HOLD    3027   // 组合键模式：按住生效
 #define ID_CHECK_INTERCEPT      3031   // 启用按键拦截
 #define ID_CHECK_TRAY           3032   // 最小化到托盘
 #define ID_CHECK_AUTOSTART      3033   // 开机自启动（写 HKCU 的 Run 键，不需要管理员）
 #define ID_BTN_APPLY            3041   // 应用
 #define ID_BTN_RESET            3042   // 重置
-#define ID_TIMER_REFRESH        4001   // 定时器刷新按键显示
+#define ID_BTN_EXIT             3043   // 退出程序（无视"最小化到托盘"）
 
 // 存档控件 ID
 #define ID_COMBO_SAVE           3061   // 存档下拉框
@@ -129,6 +134,11 @@ std::atomic<int> switchKey2(VK_SHIFT);
 std::atomic<int> switchKey3(0);
 std::atomic<int> switchKey4(0);
 
+// 组合键的生效方式：
+//   0 = 切换（按一下开、再按一下关）
+//   1 = 按住（按下时开、松开即关）
+std::atomic<int> switchHoldMode(0);
+
 // 功能开关
 std::atomic<bool> isRunning(true);            // 控制线程的运行标志，退出时置 false
 std::atomic<bool> isEnabled(true);            // 总开关是否"启用"
@@ -142,6 +152,10 @@ std::atomic<bool> keyE(false), keyS(false), keyD(false), keyF(false);
 std::atomic<bool> keyJ(false), keyK(false);
 std::atomic<bool> keyO(false), keyL(false), keyM(false);
 std::atomic<bool> keyShift(false), keyCtrl(false);
+
+// CapsLock 被设成组合键后会被钩子吞掉，系统就不再生效、也不再更新它的状态，
+// 所以由钩子自己记一份按下/松开，供 IsKeyDown 判定组合键使用。
+std::atomic<bool> capsDown(false);
 
 // 鼠标三键"当前是否处于按下状态"，用于幂等判断（同状态不重发）。
 // 与控制线程配合，避免每帧重复发送 DOWN/UP 事件。
@@ -166,6 +180,27 @@ std::vector<std::string> g_saveFiles;   // 存档文件名列表（不含路径�
 bool g_saveWritable = true;             // false = 只读模式：不写盘、也不谎报成功
 bool g_saveDirFallback = false;         // true = 已回退到 %LOCALAPPDATA% 下的目录
 bool g_backupBeforeSave = false;        // 读档失败过：下次保存前先备份原文件
+
+// ==================== 草稿配置 ====================
+// 界面上所有可改的项先写进这里的草稿，只有点"应用"/"保存"才推进内存里的
+// 原子量（真正生效），"保存"再落盘。
+// 这样"没点应用就不生效、没点保存就不落盘"的语义才成立。
+struct ConfigDraft {
+    int moveSpeed, speedMul, wheelInterval, wheelSpeed, wheelMul;   // 5 个速度数值
+    int tickMs;                                                     // 刷新间隔（毫秒）
+    int keyUp, keyDown, keyLeft, keyRight;                          // 4 个移动键
+    int keyLClick, keyRClick, keyMClick;                            // 3 个鼠标键
+    int keyWheelUp, keyWheelDown;                                   // 2 个滚轮键
+    int switch1, switch2, switch3, switch4;                         // 开关组合键
+    int switchMode;                                                 // 组合键模式：0=切换，1=按住
+    bool intercept;                                                 // 启用按键拦截
+    bool tray;                                                      // 关闭时最小化到托盘
+};
+
+ConfigDraft g_draft = {};        // 界面当前展示的草稿值
+bool g_dirty = false;            // 草稿和磁盘不一致（有没保存的修改）
+bool g_updatingUI = false;       // 正在程序化刷新控件，用来屏蔽误触发的 EN_CHANGE
+bool g_shuttingDown = false;     // 系统正在关机/注销，跳过"是否保存"的询问
 
 // ==================== 按键名称转换 ====================
 // 把虚拟键码翻译成 UI 上显示的文字。
@@ -241,21 +276,22 @@ void UpdateButtonText(HWND hwnd, int btnId, int vk) {
 }
 
 // 更新所有按键按钮文字
-// 在"重置""清空""加载存档""按键捕获完成"等会大面积改动映射的场合调用。
+// 读的是**草稿**而不是内存里的生效值：界面上要显示用户刚改、但还没点"应用"的映射。
+// 在"重置""清空""加载存档""按键捕获完成"等场合调用。
 void UpdateAllButtonText(HWND hwnd) {
-    UpdateButtonText(hwnd, ID_BTN_KEY_UP, keyUp.load());
-    UpdateButtonText(hwnd, ID_BTN_KEY_DOWN, keyDown.load());
-    UpdateButtonText(hwnd, ID_BTN_KEY_LEFT, keyLeft.load());
-    UpdateButtonText(hwnd, ID_BTN_KEY_RIGHT, keyRight.load());
-    UpdateButtonText(hwnd, ID_BTN_KEY_LCLICK, keyLClick.load());
-    UpdateButtonText(hwnd, ID_BTN_KEY_RCLICK, keyRClick.load());
-    UpdateButtonText(hwnd, ID_BTN_KEY_MCLICK, keyMClick.load());
-    UpdateButtonText(hwnd, ID_BTN_KEY_WHEELUP, keyWheelUp.load());
-    UpdateButtonText(hwnd, ID_BTN_KEY_WHEELDOWN, keyWheelDown.load());
-    UpdateButtonText(hwnd, ID_BTN_SWITCH1, switchKey1.load());
-    UpdateButtonText(hwnd, ID_BTN_SWITCH2, switchKey2.load());
-    UpdateButtonText(hwnd, ID_BTN_SWITCH3, switchKey3.load());
-    UpdateButtonText(hwnd, ID_BTN_SWITCH4, switchKey4.load());
+    UpdateButtonText(hwnd, ID_BTN_KEY_UP, g_draft.keyUp);
+    UpdateButtonText(hwnd, ID_BTN_KEY_DOWN, g_draft.keyDown);
+    UpdateButtonText(hwnd, ID_BTN_KEY_LEFT, g_draft.keyLeft);
+    UpdateButtonText(hwnd, ID_BTN_KEY_RIGHT, g_draft.keyRight);
+    UpdateButtonText(hwnd, ID_BTN_KEY_LCLICK, g_draft.keyLClick);
+    UpdateButtonText(hwnd, ID_BTN_KEY_RCLICK, g_draft.keyRClick);
+    UpdateButtonText(hwnd, ID_BTN_KEY_MCLICK, g_draft.keyMClick);
+    UpdateButtonText(hwnd, ID_BTN_KEY_WHEELUP, g_draft.keyWheelUp);
+    UpdateButtonText(hwnd, ID_BTN_KEY_WHEELDOWN, g_draft.keyWheelDown);
+    UpdateButtonText(hwnd, ID_BTN_SWITCH1, g_draft.switch1);
+    UpdateButtonText(hwnd, ID_BTN_SWITCH2, g_draft.switch2);
+    UpdateButtonText(hwnd, ID_BTN_SWITCH3, g_draft.switch3);
+    UpdateButtonText(hwnd, ID_BTN_SWITCH4, g_draft.switch4);
 }
 
 // 底部状态行：正常时显示存档路径，异常时显示原因。
@@ -447,6 +483,181 @@ void FillComboBox(HWND hwnd) {
     SendMessageA(hCombo, CB_SETCURSEL, 0, 0);
 }
 
+// ==================== 草稿 / 应用 ====================
+// 出厂默认值。重置按钮、以及"启动时没有存档"的初始草稿都用它。
+void DraftDefaults() {
+    g_draft.moveSpeed     = 2;
+    g_draft.speedMul      = 3;
+    g_draft.wheelInterval = 80;
+    g_draft.wheelSpeed    = 1;
+    g_draft.wheelMul      = 3;
+    g_draft.tickMs        = DEFAULT_TICK_MS;
+
+    g_draft.keyUp        = 'E';
+    g_draft.keyDown      = 'D';
+    g_draft.keyLeft      = 'S';
+    g_draft.keyRight     = 'F';
+    g_draft.keyLClick    = 'J';
+    g_draft.keyRClick    = 'K';
+    g_draft.keyMClick    = 'M';
+    g_draft.keyWheelUp   = 'O';
+    g_draft.keyWheelDown = 'L';
+
+    g_draft.switch1 = VK_CONTROL;
+    g_draft.switch2 = VK_SHIFT;
+    g_draft.switch3 = 0;
+    g_draft.switch4 = 0;
+    g_draft.switchMode = 0;   // 默认"按下切换"，和旧版本行为一致
+
+    g_draft.intercept = true;
+    g_draft.tray      = false;
+}
+
+// 把内存里"已生效"的值抄进草稿。
+// 启动、读档之后必须调一次，否则草稿和实际状态会脱节。
+void DraftFromApplied() {
+    g_draft.moveSpeed     = MOVE_SPEED.load();
+    g_draft.speedMul      = SPEED_MULTIPLIER.load();
+    g_draft.wheelInterval = WHEEL_INTERVAL.load();
+    g_draft.wheelSpeed    = WHEEL_SPEED.load();
+    g_draft.wheelMul      = WHEEL_SPEED_MULTIPLIER.load();
+    g_draft.tickMs        = TICK_MS.load();
+
+    g_draft.keyUp        = keyUp.load();
+    g_draft.keyDown      = keyDown.load();
+    g_draft.keyLeft      = keyLeft.load();
+    g_draft.keyRight     = keyRight.load();
+    g_draft.keyLClick    = keyLClick.load();
+    g_draft.keyRClick    = keyRClick.load();
+    g_draft.keyMClick    = keyMClick.load();
+    g_draft.keyWheelUp   = keyWheelUp.load();
+    g_draft.keyWheelDown = keyWheelDown.load();
+
+    g_draft.switch1 = switchKey1.load();
+    g_draft.switch2 = switchKey2.load();
+    g_draft.switch3 = switchKey3.load();
+    g_draft.switch4 = switchKey4.load();
+    g_draft.switchMode = switchHoldMode.load();
+
+    g_draft.intercept = interceptEnabled.load();
+    g_draft.tray      = isMinimizeToTray.load();
+}
+
+// 把草稿推进内存，真正生效。
+// 只改内存、不写盘 —— 写盘是 SaveToFile 的事。
+// 钩子线程读的是这些原子量，所以"点应用"之后行为才会变。
+void ApplyDraft() {
+    MOVE_SPEED             = g_draft.moveSpeed;
+    SPEED_MULTIPLIER       = g_draft.speedMul;
+    WHEEL_INTERVAL         = g_draft.wheelInterval;
+    WHEEL_SPEED            = g_draft.wheelSpeed;
+    WHEEL_SPEED_MULTIPLIER = g_draft.wheelMul;
+    TICK_MS                = g_draft.tickMs;
+
+    keyUp        = g_draft.keyUp;
+    keyDown      = g_draft.keyDown;
+    keyLeft      = g_draft.keyLeft;
+    keyRight     = g_draft.keyRight;
+    keyLClick    = g_draft.keyLClick;
+    keyRClick    = g_draft.keyRClick;
+    keyMClick    = g_draft.keyMClick;
+    keyWheelUp   = g_draft.keyWheelUp;
+    keyWheelDown = g_draft.keyWheelDown;
+
+    switchKey1 = g_draft.switch1;
+    switchKey2 = g_draft.switch2;
+    switchKey3 = g_draft.switch3;
+    switchKey4 = g_draft.switch4;
+    switchHoldMode = g_draft.switchMode;
+
+    interceptEnabled = g_draft.intercept;
+    isMinimizeToTray = g_draft.tray;
+}
+
+// 把 5 个编辑框的内容读进草稿。
+// 带范围钳制：空、非数字、越界一律忽略，并把编辑框改回草稿里的有效值，
+// 避免出现"框里显示空、实际保存的是旧值"这种对不上的情况。
+void ReadEditsIntoDraft(HWND hwnd) {
+    g_updatingUI = true;   // 下面回写编辑框会触发 EN_CHANGE，别把它当成用户改动
+
+    char buf[32];
+    int v;
+
+    GetDlgItemTextA(hwnd, ID_EDIT_SPEED, buf, 32);
+    v = atoi(buf);
+    if (v >= 1 && v <= 100) g_draft.moveSpeed = v;
+    else SetDlgItemInt(hwnd, ID_EDIT_SPEED, g_draft.moveSpeed, FALSE);
+
+    GetDlgItemTextA(hwnd, ID_EDIT_SPEED_MUL, buf, 32);
+    v = atoi(buf);
+    if (v >= 1 && v <= 100) g_draft.speedMul = v;
+    else SetDlgItemInt(hwnd, ID_EDIT_SPEED_MUL, g_draft.speedMul, FALSE);
+
+    GetDlgItemTextA(hwnd, ID_EDIT_WHEEL_INTERVAL, buf, 32);
+    v = atoi(buf);
+    if (v >= 1 && v <= 10000) g_draft.wheelInterval = v;
+    else SetDlgItemInt(hwnd, ID_EDIT_WHEEL_INTERVAL, g_draft.wheelInterval, FALSE);
+
+    GetDlgItemTextA(hwnd, ID_EDIT_WHEEL_SPEED, buf, 32);
+    v = atoi(buf);
+    if (v >= 1 && v <= 100) g_draft.wheelSpeed = v;
+    else SetDlgItemInt(hwnd, ID_EDIT_WHEEL_SPEED, g_draft.wheelSpeed, FALSE);
+
+    GetDlgItemTextA(hwnd, ID_EDIT_WHEEL_MUL, buf, 32);
+    v = atoi(buf);
+    if (v >= 1 && v <= 100) g_draft.wheelMul = v;
+    else SetDlgItemInt(hwnd, ID_EDIT_WHEEL_MUL, g_draft.wheelMul, FALSE);
+
+    // 刷新间隔：3~30ms。再快屏幕也刷不出来、只是白唤醒 CPU；
+    // 再慢光标会明显拖影。越界一律回退到草稿里的原值。
+    GetDlgItemTextA(hwnd, ID_EDIT_TICK, buf, 32);
+    v = atoi(buf);
+    if (v >= 3 && v <= 30) g_draft.tickMs = v;
+    else SetDlgItemInt(hwnd, ID_EDIT_TICK, g_draft.tickMs, FALSE);
+
+    g_updatingUI = false;
+}
+
+// 用草稿刷新整个界面：编辑框、两个复选框、9 个映射按钮。
+// g_updatingUI 屏蔽 SetDlgItemInt 触发的 EN_CHANGE，
+// 否则"程序自己刷新"会被当成"用户改了内容"，把脏标记错误地设上。
+void RefreshUIFromDraft(HWND hwnd) {
+    g_updatingUI = true;
+
+    SetDlgItemInt(hwnd, ID_EDIT_SPEED, g_draft.moveSpeed, FALSE);
+    SetDlgItemInt(hwnd, ID_EDIT_SPEED_MUL, g_draft.speedMul, FALSE);
+    SetDlgItemInt(hwnd, ID_EDIT_WHEEL_INTERVAL, g_draft.wheelInterval, FALSE);
+    SetDlgItemInt(hwnd, ID_EDIT_WHEEL_SPEED, g_draft.wheelSpeed, FALSE);
+    SetDlgItemInt(hwnd, ID_EDIT_WHEEL_MUL, g_draft.wheelMul, FALSE);
+    SetDlgItemInt(hwnd, ID_EDIT_TICK, g_draft.tickMs, FALSE);
+
+    CheckDlgButton(hwnd, ID_CHECK_INTERCEPT,
+                   g_draft.intercept ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, ID_CHECK_TRAY,
+                   g_draft.tray ? BST_CHECKED : BST_UNCHECKED);
+
+    // 两个单选按钮必须成组刷新：CheckRadioButton 会把组内其它按钮取消勾选。
+    // 注意它只发 BM_SETCHECK，不会回发 WM_COMMAND，所以不会把界面刷新当成用户操作。
+    CheckRadioButton(hwnd, ID_RADIO_SWITCH_TOGGLE, ID_RADIO_SWITCH_HOLD,
+                     g_draft.switchMode == 0 ? ID_RADIO_SWITCH_TOGGLE : ID_RADIO_SWITCH_HOLD);
+
+    UpdateAllButtonText(hwnd);
+
+    g_updatingUI = false;
+}
+
+// 取下拉框当前选中的存档名；选的是 "+" 或者根本没选，返回空串。
+std::string GetSelectedSlot(HWND hwnd) {
+    HWND hCombo = GetDlgItem(hwnd, ID_COMBO_SAVE);
+    int sel = (int)SendMessageA(hCombo, CB_GETCURSEL, 0, 0);
+    if (sel < 0) return "";
+
+    char name[256] = {};
+    SendMessageA(hCombo, CB_GETLBTEXT, sel, (LPARAM)name);
+    if (strcmp(name, "+") == 0) return "";
+    return name;
+}
+
 // ==================== 存档读写 ====================
 // 把当前设置写到指定文件
 // 每个配置项独立 WritePrivateProfileStringA，属于"按键值覆盖"，
@@ -477,6 +688,10 @@ bool SaveToFile(const std::string& name) {
     sprintf_s(buf, "%d", WHEEL_SPEED_MULTIPLIER.load());
     WritePrivateProfileStringA("Speed", "WHEEL_SPEED_MULTIPLIER", buf, path.c_str());
 
+    // 刷新间隔：也放在 [Speed] 段，因为界面上它在速度组里。
+    sprintf_s(buf, "%d", TICK_MS.load());
+    WritePrivateProfileStringA("Speed", "tickMs", buf, path.c_str());
+
     // 按键映射：直接存 VK 码数值，读回时按需解释，不依赖键名表。
     sprintf_s(buf, "%d", keyUp.load());
     WritePrivateProfileStringA("Keys", "keyUp", buf, path.c_str());
@@ -506,6 +721,11 @@ bool SaveToFile(const std::string& name) {
     WritePrivateProfileStringA("Switch", "switchKey3", buf, path.c_str());
     sprintf_s(buf, "%d", switchKey4.load());
     WritePrivateProfileStringA("Switch", "switchKey4", buf, path.c_str());
+
+    // 组合键模式：0=切换，1=按住。
+    // 旧存档没有这个键，读的时候默认 0，行为和老版本一致。
+    sprintf_s(buf, "%d", switchHoldMode.load());
+    WritePrivateProfileStringA("Switch", "holdMode", buf, path.c_str());
 
     // 布尔值用 "1"/"0" 存，读时用 !=0 判断，对旧存档也兼容。
     WritePrivateProfileStringA("Options", "interceptEnabled",
@@ -545,6 +765,12 @@ LoadResult LoadFromFile(const std::string& name) {
     WHEEL_SPEED = GetPrivateProfileIntA("Speed", "WHEEL_SPEED", 1, path.c_str());
     WHEEL_SPEED_MULTIPLIER = GetPrivateProfileIntA("Speed", "WHEEL_SPEED_MULTIPLIER", 3, path.c_str());
 
+    // 刷新间隔必须在这里就钳住：如果 ini 被手改成 0 或负数，
+    // Wait(0) 会退化成忙等死循环，把 CPU 拉满。
+    TICK_MS = GetPrivateProfileIntA("Speed", "tickMs", DEFAULT_TICK_MS, path.c_str());
+    if (TICK_MS.load() < 3)  TICK_MS = 3;
+    if (TICK_MS.load() > 30) TICK_MS = 30;
+
     keyUp = GetPrivateProfileIntA("Keys", "keyUp", 69, path.c_str());
     keyDown = GetPrivateProfileIntA("Keys", "keyDown", 68, path.c_str());
     keyLeft = GetPrivateProfileIntA("Keys", "keyLeft", 83, path.c_str());
@@ -559,34 +785,43 @@ LoadResult LoadFromFile(const std::string& name) {
     switchKey2 = GetPrivateProfileIntA("Switch", "switchKey2", 16, path.c_str());
     switchKey3 = GetPrivateProfileIntA("Switch", "switchKey3", 0, path.c_str());
     switchKey4 = GetPrivateProfileIntA("Switch", "switchKey4", 0, path.c_str());
+    switchHoldMode = GetPrivateProfileIntA("Switch", "holdMode", 0, path.c_str());
 
     interceptEnabled = GetPrivateProfileIntA("Options", "interceptEnabled", 1, path.c_str()) != 0;
     isMinimizeToTray = GetPrivateProfileIntA("Options", "isMinimizeToTray", 0, path.c_str()) != 0;
 
-    // 把值填到 UI 控件
-    SetDlgItemInt(g_hMainWnd, ID_EDIT_SPEED, MOVE_SPEED.load(), FALSE);
-    SetDlgItemInt(g_hMainWnd, ID_EDIT_SPEED_MUL, SPEED_MULTIPLIER.load(), FALSE);
-    SetDlgItemInt(g_hMainWnd, ID_EDIT_WHEEL_INTERVAL, WHEEL_INTERVAL.load(), FALSE);
-    SetDlgItemInt(g_hMainWnd, ID_EDIT_WHEEL_SPEED, WHEEL_SPEED.load(), FALSE);
-    SetDlgItemInt(g_hMainWnd, ID_EDIT_WHEEL_MUL, WHEEL_SPEED_MULTIPLIER.load(), FALSE);
+    // 读进来的是"已生效"的值，草稿要同步一份，界面再按草稿刷新。
+    // 只走 RefreshUIFromDraft 这一条路，保证界面文字和草稿永远一致。
+    DraftFromApplied();
+    RefreshUIFromDraft(g_hMainWnd);
+    g_dirty = false;   // 刚读进来，内存和文件是一致的
 
-    CheckDlgButton(g_hMainWnd, ID_CHECK_INTERCEPT,
-        interceptEnabled.load() ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(g_hMainWnd, ID_CHECK_TRAY,
-        isMinimizeToTray.load() ? BST_CHECKED : BST_UNCHECKED);
-
-    UpdateAllButtonText(g_hMainWnd);
     return LOAD_OK;
+}
+
+// 判断某个键是否属于当前四个开关槽位。
+// 槽位为 0 表示空位，不参与判定；vk 为 0 时直接返回 false。
+bool IsSwitchMember(int vk) {
+    return vk != 0 &&
+           (vk == switchKey1.load() || vk == switchKey2.load() ||
+            vk == switchKey3.load() || vk == switchKey4.load());
 }
 
 // ==================== 判断是否需要拦截 ====================
 bool ShouldIntercept(DWORD vkCode) {
+    // CapsLock 参与组合键时必须吞掉：不吞的话按一下就把大小写翻转了，
+    // 而它又常被拿来当"手刹"式的开关，副作用太大。
+    // 这里特意不受 isEnabled 影响 —— 否则"禁用"状态下按组合键仍会切大小写；
+    // 但仍然尊重用户手动关掉"启用按键拦截"的选择。
+    if (vkCode == VK_CAPITAL && IsSwitchMember((int)vkCode))
+        return interceptEnabled.load();
+
     // 总开关未启用、或用户手动关闭拦截时，一律放行。
     if (!isEnabled || !interceptEnabled) return false;
 
-    // 组合键成员不拦截，保证 GetAsyncKeyState 能读到按键状态
+    // 其余组合键成员不拦截，保证 GetAsyncKeyState 能读到按键状态
     // 否则 Ctrl/Shift 这类键被吞掉，系统层面永远"没按下"，组合键形同失效。
-    if (vkCode == switchKey1.load() || vkCode == switchKey2.load() || vkCode == switchKey3.load() || vkCode == switchKey4.load()) return false;
+    if (IsSwitchMember((int)vkCode)) return false;
 
     // 映射键：处于启用+拦截状态时吞掉，防止按键透传到前台窗口。
     return vkCode == keyUp.load() || vkCode == keyDown.load() ||
@@ -652,10 +887,14 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
 
             SetKeyState(vk, true);
+            // 先记 CapsLock 的按下状态，再决定要不要吞 ——
+            // 一旦被吞，系统就不会再更新它，只能靠这里自己维护。
+            if (vk == VK_CAPITAL) capsDown = true;
             if (ShouldIntercept(vk)) return 1;
         } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
             // 松开也要同步状态 + 视情况拦截，否则被吞的键会一直"按着"。
             SetKeyState(vk, false);
+            if (vk == VK_CAPITAL) capsDown = false;
             if (ShouldIntercept(vk)) return 1;
         }
     }
@@ -751,9 +990,11 @@ void MouseMoveTo(int x, int y) {
 // ==================== 开关检测 ====================
 
 // 判断指定键是否按下（左右分键合并判断）
-// 直接用 GetAsyncKeyState 而不是钩子里维护的原子状态——因为组合键
-// 成员是"放行"的，如果走自维护状态，中途可能被系统吞掉键、状态卡死。
+// 组合键成员一般是"放行"的，所以直接读 GetAsyncKeyState 最可靠；
+// 但 CapsLock 是个例外：它被拦截后系统收不到，只能读钩子里自维护的 capsDown。
 bool IsKeyDown(int vk) {
+    if (vk == VK_CAPITAL) return capsDown.load();
+
     switch (vk) {
         case VK_SHIFT:   return ((GetAsyncKeyState(VK_LSHIFT)   | GetAsyncKeyState(VK_RSHIFT))   & 0x8000) != 0;
         case VK_CONTROL: return ((GetAsyncKeyState(VK_LCONTROL) | GetAsyncKeyState(VK_RCONTROL)) & 0x8000) != 0;
@@ -826,6 +1067,18 @@ private:
     HANDLE h = NULL;
 };
 
+// 更新标题栏的启用/禁用提示。
+// 控制线程里直接调 SetWindowTextA 是安全的：窗口文本的修改会被转发到
+// 创建窗口的线程执行，不会跨线程碰 UI 对象。
+void UpdateTitleState() {
+    HWND hwnd = FindWindowA("MyClass", NULL);
+    if (hwnd != NULL) {
+        std::string title = "光标控制 ";
+        title += isEnabled.load() ? "[启用]" : "[禁用]";
+        SetWindowTextA(hwnd, title.c_str());
+    }
+}
+
 // ==================== 鼠标控制线程 ====================
 // 按 TICK_MS 节拍轮询原子标志，驱动鼠标；所有输出都是"事件注入"或"位置设置"。
 void MouseControlThread() {
@@ -836,10 +1089,26 @@ void MouseControlThread() {
     if (timer.coarse) timeBeginPeriod(1);   // 老系统：普通定时器精度不够
 
     while (isRunning) {
-        // ---------- 组合键边沿触发切换 ----------
-        bool currentToggleState = IsSwitchPressed();
-        if (currentToggleState && !lastToggleState) {
-            // 只在"松开→按下"这一刻切换一次；按住不放不会反复切换。
+        // ---------- 组合键 / 总开关 ----------
+        bool pressed = IsSwitchPressed();
+        bool holdMode = (switchHoldMode.load() != 0);
+
+        if (holdMode) {
+            // 按住模式：总开关直接跟随组合键——按下即开，松开即关。
+            // 用 pressed != isEnabled 判断，只在状态真翻转时重放鼠标和改标题，
+            // 不会每帧都刷一次。
+            if (pressed != isEnabled.load()) {
+                isEnabled = pressed;
+                if (pressed) {
+                    // 启用瞬间补发一次"绝对坐标鼠标移动"，兼容只监听 MOUSEMOVE 的全屏程序
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    MouseMoveTo(pt.x, pt.y);
+                }
+                UpdateTitleState();
+            }
+        } else if (pressed && !lastToggleState) {
+            // 切换模式：只在"松开→按下"这一刻翻转一次，按住不放不会反复切。
             isEnabled = !isEnabled;
 
             if (isEnabled) {
@@ -851,24 +1120,19 @@ void MouseControlThread() {
                 MouseMoveTo(pt.x, pt.y);
             }
 
-            // 更新标题，向用户反馈当前状态。
-            HWND hwnd = FindWindowA("MyClass", NULL);
-            if (hwnd) {
-                std::string title = "光标控制 ";
-                title += isEnabled ? "[启用]" : "[禁用]";
-                SetWindowTextA(hwnd, title.c_str());
-            }
+            UpdateTitleState();
         }
-        lastToggleState = currentToggleState;
+        lastToggleState = pressed;
 
-        // 组合键按住期间跳过映射，避免切换瞬间被组合键成员误触发
+        // 切换模式下，组合键按住期间跳过映射，避免切换瞬间被组合键成员误触发，
         // 同时主动松开三键，防止"按住组合键但鼠标还处于按下"这种矛盾状态。
-        if (currentToggleState)
+        // 按住模式不能跳：那段逻辑正是"按住才生效"要走的路径。
+        if (!holdMode && pressed)
         {
             MouseLeftUp();
             MouseRightUp();
             MouseMiddleUp();
-            timer.Wait(TICK_MS);
+            timer.Wait(TICK_MS.load());
             continue;
         }
 
@@ -877,7 +1141,7 @@ void MouseControlThread() {
             MouseLeftUp();
             MouseRightUp();
             MouseMiddleUp();
-            timer.Wait(TICK_MS);
+            timer.Wait(TICK_MS.load());
             continue;
         }
 
@@ -931,7 +1195,7 @@ void MouseControlThread() {
 
         // ---------- 节拍等待 ----------
         // TICK_MS 略高于 144/165Hz 的刷新周期；线程在这里阻塞，不占 CPU。
-        timer.Wait(TICK_MS);
+        timer.Wait(TICK_MS.load());
     }
 
     if (timer.coarse) timeEndPeriod(1);
@@ -961,59 +1225,13 @@ void RemoveTrayIcon() {
     Shell_NotifyIconA(NIM_DELETE, &g_nid);
 }
 
-// ==================== 读取 UI 值到变量 ====================
-// 带范围钳制：任何非法输入（空、越界、非数字）都会被忽略，保持当前值。
-// 这样用户误删一个字符再点"应用"也不会把速度刷成 0。
-void ApplyUIValues(HWND hwnd) {
-    char buf[32];
-
-    GetDlgItemTextA(hwnd, ID_EDIT_SPEED, buf, 32);
-    int v = atoi(buf); if (v >= 1 && v <= 100) MOVE_SPEED = v;
-
-    GetDlgItemTextA(hwnd, ID_EDIT_SPEED_MUL, buf, 32);
-    v = atoi(buf); if (v >= 1 && v <= 100) SPEED_MULTIPLIER = v;
-
-    GetDlgItemTextA(hwnd, ID_EDIT_WHEEL_INTERVAL, buf, 32);
-    v = atoi(buf); if (v >= 1 && v <= 10000) WHEEL_INTERVAL = v;
-
-    GetDlgItemTextA(hwnd, ID_EDIT_WHEEL_SPEED, buf, 32);
-    v = atoi(buf); if (v >= 1 && v <= 100) WHEEL_SPEED = v;
-
-    GetDlgItemTextA(hwnd, ID_EDIT_WHEEL_MUL, buf, 32);
-    v = atoi(buf); if (v >= 1 && v <= 100) WHEEL_SPEED_MULTIPLIER = v;
-}
-
-// ==================== 重置 UI 值 ====================
-// 恢复"出厂默认"，同时刷新界面控件与按钮文字。
-void ResetUIValues(HWND hwnd) {
-    MOVE_SPEED = 2;
-    SPEED_MULTIPLIER = 3;
-    WHEEL_INTERVAL = 80;
-    WHEEL_SPEED = 1;
-    WHEEL_SPEED_MULTIPLIER = 3;
-
-    keyUp = 'E'; keyDown = 'D'; keyLeft = 'S'; keyRight = 'F';
-    keyLClick = 'J'; keyRClick = 'K'; keyMClick = 'M';
-    keyWheelUp = 'O'; keyWheelDown = 'L';
-
-    switchKey1 = VK_CONTROL;
-    switchKey2 = VK_SHIFT;
-    switchKey3 = 0;
-    switchKey4 = 0;
-
-    interceptEnabled = true;
-    isMinimizeToTray = false;
-
-    SetDlgItemInt(hwnd, ID_EDIT_SPEED, 2, FALSE);
-    SetDlgItemInt(hwnd, ID_EDIT_SPEED_MUL, 3, FALSE);
-    SetDlgItemInt(hwnd, ID_EDIT_WHEEL_INTERVAL, 80, FALSE);
-    SetDlgItemInt(hwnd, ID_EDIT_WHEEL_SPEED, 1, FALSE);
-    SetDlgItemInt(hwnd, ID_EDIT_WHEEL_MUL, 3, FALSE);
-
-    CheckDlgButton(hwnd, ID_CHECK_INTERCEPT, BST_CHECKED);
-    CheckDlgButton(hwnd, ID_CHECK_TRAY, BST_UNCHECKED);
-
-    UpdateAllButtonText(hwnd);
+// ==================== 重置 ====================
+// 只把草稿恢复成出厂默认并刷新界面，**不**推进内存、**不**写盘。
+// 想让它生效得再点"应用"，想让它持久化得点"保存" —— 和其他修改走同一套规则。
+void ResetDraftAndUI(HWND hwnd) {
+    DraftDefaults();
+    RefreshUIFromDraft(hwnd);
+    g_dirty = true;   // 界面已经变了，属于"未保存的修改"
 }
 
 // ==================== 开机自启动 ====================
@@ -1075,14 +1293,47 @@ bool SetAutoStart(bool enable) {
     return ret == ERROR_SUCCESS;
 }
 
+// ==================== 保存 ====================
+// 保存 = 草稿 → 内存（生效） → 写所选存档 → 镜像写 save0。
+// 镜像 save0 是为了让"下次启动恢复上次保存的状态"成立：
+// save0 不再由退出流程隐式写入，只在显式保存时更新。
+// 返回 false 表示没写成，调用方不能清脏标记。
+bool DoSave(HWND hwnd, const std::string& slot) {
+    if (!g_saveWritable) return false;
+
+    ReadEditsIntoDraft(hwnd);   // 编辑框里可能还有没点"应用"的数字
+    ApplyDraft();
+
+    bool ok = true;
+    if (!slot.empty()) ok = SaveToFile(slot);   // 所选存档
+    if (ok) ok = SaveToFile("save0");           // 镜像：启动时读它
+    if (ok) g_dirty = false;                    // 只有真写成功了才清脏标记
+
+    return ok;
+}
+
 // ==================== 统一退出入口 ====================
-// 关窗（非托盘）与托盘右键"退出"都走这里：
-// 先把界面上的数字收回内存，再写 save0，最后销毁窗口。
-// 旧实现里托盘"退出"直接 DestroyWindow，绕过了 ApplyUIValues，
-// 用户改完数字没点"应用"就退出会丢修改。
+// 窗口关闭（非托盘模式）和托盘右键"退出"都走这里。
+// 有未保存的修改时问一句：是=保存后退出，否=直接退出，取消=回到窗口。
+// 两种例外直接退：系统正在关机/注销、以及只读模式（根本存不了，问了是骗人）。
 void QuitApp(HWND hwnd) {
-    ApplyUIValues(hwnd);
-    SaveToFile("save0");
+    if (!g_shuttingDown && g_dirty && g_saveWritable) {
+        int r = MessageBoxA(hwnd,
+            "设置已修改但还没保存，退出前保存吗？",
+            "退出", MB_YESNOCANCEL | MB_ICONQUESTION);
+
+        if (r == IDCANCEL) return;          // 取消：留在窗口继续编辑
+        if (r == IDYES) {
+            std::string slot = GetSelectedSlot(hwnd);
+            if (!DoSave(hwnd, slot)) {
+                // 存失败就别退，否则改动直接丢了
+                MessageBoxA(hwnd, "保存失败，已取消退出。请检查存档目录后重试。",
+                            "错误", MB_OK | MB_ICONERROR);
+                return;
+            }
+        }
+        // IDNO：不保存，直接往下走
+    }
     DestroyWindow(hwnd);
 }
 
@@ -1090,189 +1341,217 @@ void QuitApp(HWND hwnd) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE: {
-            // 创建时一次性把所有控件"布局"出来。
-            // 通过 y 逐行推进，比一堆手写固定坐标可读。
+            // ==================== 布局参数 ====================
+            // 改成绝对坐标 + 分组框的排版，不再靠 y 逐行累加：
+            //   外距 M=12，左右两栏各 292 宽，栏间距 8，行距 28，控件高 24。
+            // 窗口大小在 WinMain 里定死（640×580），这里不处理 WM_SIZE，
+            // 所以拉动窗口边缘时控件不会跟着走 —— 这是已知限制，不是 bug。
             g_hMainWnd = hwnd;
 
-            int y = 10;
-            const int labelW = 80;
-            const int editW = 60;
-            const int rowH = 28;   // 每行的高（包含间隙）
+            const int M     = 12;             // 外边距
+            const int colW  = 292;            // 每栏宽度
+            const int col2  = M + colW + 8;   // 右栏起点 = 312
+            const int ctlH  = 24;             // 控件高度
+            const int wideW = 592;            // 跨两栏的宽度
 
-            CreateWindowA("STATIC", "光标控制",
-                WS_VISIBLE | WS_CHILD,
-                10, y, 200, 20, hwnd, NULL, NULL, NULL);
-            y += 25;
+            // ---------- 顶部：开关 ----------
+            // 和下面的"速度""按键映射"一样用分组框，视觉上属于同一套分区，
+            // 不再让三个复选框裸放在窗口最上面。
+            // 组高 58：标题占 22，复选框在 34 处，底部再留 12 的余量。
+            CreateWindowA("BUTTON", "开关",
+                WS_VISIBLE | WS_CHILD | BS_GROUPBOX,
+                M, M, wideW, 58, hwnd, NULL, NULL, NULL);
 
-            CreateWindowA("STATIC", "── 速度设置 ──",
-                WS_VISIBLE | WS_CHILD,
-                10, y, 200, 20, hwnd, NULL, NULL, NULL);
-            y += 22;
-
-            // 移动速度：像素/帧
-            CreateWindowA("STATIC", "移动速度:",
-                WS_VISIBLE | WS_CHILD, 10, y + 3, labelW, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("EDIT", "2",
-                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
-                95, y, editW, 22, hwnd, (HMENU)ID_EDIT_SPEED, NULL, NULL);
-            y += rowH;
-
-            // Shift 加速倍率
-            CreateWindowA("STATIC", "Shift加速:",
-                WS_VISIBLE | WS_CHILD, 10, y + 3, labelW, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("EDIT", "3",
-                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
-                95, y, editW, 22, hwnd, (HMENU)ID_EDIT_SPEED_MUL, NULL, NULL);
-            y += rowH;
-
-            // 滚轮最小间隔（毫秒）
-            CreateWindowA("STATIC", "滚轮间隔(ms):",
-                WS_VISIBLE | WS_CHILD, 10, y + 3, 100, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("EDIT", "80",
-                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
-                115, y, editW, 22, hwnd, (HMENU)ID_EDIT_WHEEL_INTERVAL, NULL, NULL);
-            y += rowH;
-
-            // 滚轮单次档位
-            CreateWindowA("STATIC", "滚轮速度:",
-                WS_VISIBLE | WS_CHILD, 10, y + 3, labelW, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("EDIT", "1",
-                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
-                95, y, editW, 22, hwnd, (HMENU)ID_EDIT_WHEEL_SPEED, NULL, NULL);
-            y += rowH;
-
-            // Shift 滚轮倍率
-            CreateWindowA("STATIC", "滚轮加速:",
-                WS_VISIBLE | WS_CHILD, 10, y + 3, labelW, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("EDIT", "3",
-                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
-                95, y, editW, 22, hwnd, (HMENU)ID_EDIT_WHEEL_MUL, NULL, NULL);
-            y += rowH + 10;
-
-            CreateWindowA("STATIC", "── 按键映射 ──",
-                WS_VISIBLE | WS_CHILD,
-                10, y, 200, 20, hwnd, NULL, NULL, NULL);
-            y += 22;
-
-            // 两列布局：x1 左列，x2 右列；btnW 按钮宽
-            int x1 = 10, x2 = 180;
-            int btnW = 70;
-
-            // 上 / 下
-            CreateWindowA("STATIC", "上:", WS_VISIBLE | WS_CHILD, x1, y + 3, 25, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "E", WS_VISIBLE | WS_CHILD, x1 + 28, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_UP, NULL, NULL);
-            CreateWindowA("STATIC", "下:", WS_VISIBLE | WS_CHILD, x2, y + 3, 25, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "D", WS_VISIBLE | WS_CHILD, x2 + 28, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_DOWN, NULL, NULL);
-            y += rowH;
-
-            // 左 / 右
-            CreateWindowA("STATIC", "左:", WS_VISIBLE | WS_CHILD, x1, y + 3, 25, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "S", WS_VISIBLE | WS_CHILD, x1 + 28, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_LEFT, NULL, NULL);
-            CreateWindowA("STATIC", "右:", WS_VISIBLE | WS_CHILD, x2, y + 3, 25, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "F", WS_VISIBLE | WS_CHILD, x2 + 28, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_RIGHT, NULL, NULL);
-            y += rowH;
-
-            // 左键 / 右键
-            CreateWindowA("STATIC", "左键:", WS_VISIBLE | WS_CHILD, x1, y + 3, 45, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "J", WS_VISIBLE | WS_CHILD, x1 + 48, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_LCLICK, NULL, NULL);
-            CreateWindowA("STATIC", "右键:", WS_VISIBLE | WS_CHILD, x2, y + 3, 45, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "K", WS_VISIBLE | WS_CHILD, x2 + 48, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_RCLICK, NULL, NULL);
-            y += rowH;
-
-            // 中键 / 上滚
-            CreateWindowA("STATIC", "中键:", WS_VISIBLE | WS_CHILD, x1, y + 3, 45, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "M", WS_VISIBLE | WS_CHILD, x1 + 48, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_MCLICK, NULL, NULL);
-            CreateWindowA("STATIC", "上滚:", WS_VISIBLE | WS_CHILD, x2, y + 3, 45, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "O", WS_VISIBLE | WS_CHILD, x2 + 48, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_WHEELUP, NULL, NULL);
-            y += rowH;
-
-            // 下滚
-            CreateWindowA("STATIC", "下滚:", WS_VISIBLE | WS_CHILD, x1, y + 3, 45, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowA("BUTTON", "L", WS_VISIBLE | WS_CHILD, x1 + 48, y, btnW, 24, hwnd, (HMENU)ID_BTN_KEY_WHEELDOWN, NULL, NULL);
-            y += rowH + 10;
-
-            // ========== 开关组合键 ==========
-            // 1~4 个按钮分别对应 switchKey1..4；点击后进入"捕获模式"。
-            CreateWindowA("STATIC", "── 开关组合键（1~4 个键） ──",
-                WS_VISIBLE | WS_CHILD,
-                10, y, 300, 20, hwnd, NULL, NULL, NULL);
-            y += 22;
-
-            CreateWindowA("BUTTON", "Ctrl", WS_VISIBLE | WS_CHILD, 10, y, 70, 24, hwnd, (HMENU)ID_BTN_SWITCH1, NULL, NULL);
-            CreateWindowA("BUTTON", "Shift", WS_VISIBLE | WS_CHILD, 90, y, 70, 24, hwnd, (HMENU)ID_BTN_SWITCH2, NULL, NULL);
-            CreateWindowA("BUTTON", "无", WS_VISIBLE | WS_CHILD, 170, y, 70, 24, hwnd, (HMENU)ID_BTN_SWITCH3, NULL, NULL);
-            CreateWindowA("BUTTON", "无", WS_VISIBLE | WS_CHILD, 250, y, 70, 24, hwnd, (HMENU)ID_BTN_SWITCH4, NULL, NULL);
-            CreateWindowA("BUTTON", "清空全部", WS_VISIBLE | WS_CHILD, 330, y, 80, 24, hwnd, (HMENU)ID_BTN_CLEAR_SWITCH, NULL, NULL);
-            y += rowH + 10;
-
-            // ========== 开关 ==========
-            CreateWindowA("STATIC", "── 开关 ──",
-                WS_VISIBLE | WS_CHILD,
-                10, y, 200, 20, hwnd, NULL, NULL, NULL);
-            y += 22;
+            const int chkY = M + 22;   // 复选框在组内的 y
 
             CreateWindowA("BUTTON", "启用按键拦截",
                 WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-                10, y, 150, 24, hwnd, (HMENU)ID_CHECK_INTERCEPT, NULL, NULL);
+                M + 12, chkY, 150, ctlH, hwnd, (HMENU)ID_CHECK_INTERCEPT, NULL, NULL);
             CheckDlgButton(hwnd, ID_CHECK_INTERCEPT, BST_CHECKED);
-            y += rowH;
 
             CreateWindowA("BUTTON", "关闭时最小化到托盘",
                 WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-                10, y, 180, 24, hwnd, (HMENU)ID_CHECK_TRAY, NULL, NULL);
-            y += rowH;
+                M + 174, chkY, 180, ctlH, hwnd, (HMENU)ID_CHECK_TRAY, NULL, NULL);
 
             // 开机自启动：勾选状态直接读注册表，不经过 ini，
             // 避免"ini 里存的是开、注册表里实际没写"这种两处状态打架。
             CreateWindowA("BUTTON", "开机自启动",
                 WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
-                10, y, 150, 24, hwnd, (HMENU)ID_CHECK_AUTOSTART, NULL, NULL);
+                M + 366, chkY, 130, ctlH, hwnd, (HMENU)ID_CHECK_AUTOSTART, NULL, NULL);
             if (IsAutoStartEnabled()) {
                 CheckDlgButton(hwnd, ID_CHECK_AUTOSTART, BST_CHECKED);
                 // 顺手把路径刷一遍：用户可能把 exe 挪过位置，
                 // 这里用当前路径覆盖旧值，省得下次开机找不到程序。
                 SetAutoStart(true);
             }
-            y += rowH + 10;
 
-            CreateWindowA("BUTTON", "应用", WS_VISIBLE | WS_CHILD, 10, y, 80, 30, hwnd, (HMENU)ID_BTN_APPLY, NULL, NULL);
-            CreateWindowA("BUTTON", "重置", WS_VISIBLE | WS_CHILD, 100, y, 80, 30, hwnd, (HMENU)ID_BTN_RESET, NULL, NULL);
+            // ---------- 左栏：速度 ----------
+            // BS_GROUPBOX 只是画个框和标题，里面的控件仍然是主窗口的子窗口，
+            // 所以坐标必须写绝对位置；先创建分组框，控件才会画在它上面。
+            CreateWindowA("BUTTON", "速度",
+                WS_VISIBLE | WS_CHILD | BS_GROUPBOX,
+                M, 78, colW, 210, hwnd, NULL, NULL, NULL);
 
-            // 提示：Esc+0 只在窗口前台有效
-            CreateWindowA("STATIC", "重置快捷键：Esc + 0（仅窗口在前台时）",
-                WS_VISIBLE | WS_CHILD,
-                10, y + 40, 300, 20, hwnd, NULL, NULL, NULL);
+            const int sx = M + 12;    // 组内左边距
+            const int vx = M + 108;   // 数值框的 x
 
-            // 底部状态行：显示存档目录 / 只读 / 读取失败等信息。
-            // SS_ENDELLIPSIS 让过长的路径自动变成省略号，不撑破窗口。
-            CreateWindowA("STATIC", "",
-                WS_VISIBLE | WS_CHILD | SS_ENDELLIPSIS,
-                10, y + 62, 480, 18, hwnd, (HMENU)ID_STATIC_STATUS, NULL, NULL);
+            CreateWindowA("STATIC", "移动速度:",
+                WS_VISIBLE | WS_CHILD, sx, 106 + 3, 90, 18, hwnd, NULL, NULL, NULL);
+            CreateWindowA("EDIT", "2",
+                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                vx, 106, 64, 22, hwnd, (HMENU)ID_EDIT_SPEED, NULL, NULL);
 
-            // ==================== 右侧存档区 ====================
-            int ry = 10;
+            CreateWindowA("STATIC", "Shift加速:",
+                WS_VISIBLE | WS_CHILD, sx, 134 + 3, 90, 18, hwnd, NULL, NULL, NULL);
+            CreateWindowA("EDIT", "3",
+                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                vx, 134, 64, 22, hwnd, (HMENU)ID_EDIT_SPEED_MUL, NULL, NULL);
 
-            CreateWindowA("STATIC", "── 存档 ──",
-                WS_VISIBLE | WS_CHILD,
-                350, ry, 160, 20, hwnd, NULL, NULL, NULL);
-            ry += 25;
+            CreateWindowA("STATIC", "滚轮间隔(ms):",
+                WS_VISIBLE | WS_CHILD, sx, 162 + 3, 96, 18, hwnd, NULL, NULL, NULL);
+            CreateWindowA("EDIT", "80",
+                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                vx, 162, 64, 22, hwnd, (HMENU)ID_EDIT_WHEEL_INTERVAL, NULL, NULL);
 
-            // 下拉框：CBS_DROPDOWNLIST 禁止用户编辑文本，只能从列表中选择
+            CreateWindowA("STATIC", "滚轮速度:",
+                WS_VISIBLE | WS_CHILD, sx, 190 + 3, 90, 18, hwnd, NULL, NULL, NULL);
+            CreateWindowA("EDIT", "1",
+                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                vx, 190, 64, 22, hwnd, (HMENU)ID_EDIT_WHEEL_SPEED, NULL, NULL);
+
+            CreateWindowA("STATIC", "滚轮加速:",
+                WS_VISIBLE | WS_CHILD, sx, 218 + 3, 90, 18, hwnd, NULL, NULL, NULL);
+            CreateWindowA("EDIT", "3",
+                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                vx, 218, 64, 22, hwnd, (HMENU)ID_EDIT_WHEEL_MUL, NULL, NULL);
+
+            // 刷新间隔：控制线程多久醒一次。数值越小越跟手、CPU 唤醒越频繁。
+            // 放在这一组是因为它也是"数值型"设置，用户找的时候比较顺手。
+            CreateWindowA("STATIC", "刷新间隔(ms):",
+                WS_VISIBLE | WS_CHILD, sx, 246 + 3, 96, 18, hwnd, NULL, NULL, NULL);
+            CreateWindowA("EDIT", "6",
+                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                vx, 246, 64, 22, hwnd, (HMENU)ID_EDIT_TICK, NULL, NULL);
+
+            // 应用 / 重置都是全量操作：它们推进的是整份草稿
+            // （5 个速度数值 + 刷新间隔 + 9 个映射 + 4 个组合键 + 2 个复选框），
+            // 所以不放在本组里，统一挪到窗口底部右侧。
+
+            // ---------- 右栏：按键映射 ----------
+            CreateWindowA("BUTTON", "按键映射",
+                WS_VISIBLE | WS_CHILD | BS_GROUPBOX,
+                col2, 78, colW, 210, hwnd, NULL, NULL, NULL);
+
+            // 组内排两列，每列「标签 44 + 按键按钮 76」。
+            const int kx1 = col2 + 12;           // 第一列标签 x
+            const int kx2 = col2 + 12 + 136;     // 第二列标签 x
+            const int bw  = 76;                  // 按键按钮宽
+
+            // 9 个映射的创建逻辑完全一样，用 lambda 收口，避免复制 9 遍。
+            // 按钮初始文字取当前映射值，和 UpdateAllButtonText 的结果一致。
+            auto addKeyRow = [&](int x, int y, const char* label, int btnId, int vk) {
+                CreateWindowA("STATIC", label,
+                    WS_VISIBLE | WS_CHILD, x, y + 3, 44, 18, hwnd, NULL, NULL, NULL);
+                CreateWindowA("BUTTON", GetKeyName(vk).c_str(),
+                    WS_VISIBLE | WS_CHILD, x + 46, y, bw, ctlH,
+                    hwnd, (HMENU)(INT_PTR)btnId, NULL, NULL);
+            };
+
+            addKeyRow(kx1, 106, "上:",   ID_BTN_KEY_UP,        keyUp.load());
+            addKeyRow(kx2, 106, "下:",   ID_BTN_KEY_DOWN,      keyDown.load());
+            addKeyRow(kx1, 134, "左:",   ID_BTN_KEY_LEFT,      keyLeft.load());
+            addKeyRow(kx2, 134, "右:",   ID_BTN_KEY_RIGHT,     keyRight.load());
+            addKeyRow(kx1, 162, "左键:", ID_BTN_KEY_LCLICK,    keyLClick.load());
+            addKeyRow(kx2, 162, "右键:", ID_BTN_KEY_RCLICK,    keyRClick.load());
+            addKeyRow(kx1, 190, "中键:", ID_BTN_KEY_MCLICK,    keyMClick.load());
+            addKeyRow(kx2, 190, "上滚:", ID_BTN_KEY_WHEELUP,   keyWheelUp.load());
+            addKeyRow(kx1, 218, "下滚:", ID_BTN_KEY_WHEELDOWN, keyWheelDown.load());
+
+            // ---------- 开关组合键：跨两栏一整条 ----------
+            // 高度 96：第一行 4 个槽位 + 清空，第二行两个模式单选按钮。
+            CreateWindowA("BUTTON", "开关组合键（1~4 个键同时按下）",
+                WS_VISIBLE | WS_CHILD | BS_GROUPBOX,
+                M, 296, wideW, 96, hwnd, NULL, NULL, NULL);
+
+            CreateWindowA("BUTTON", "Ctrl",
+                WS_VISIBLE | WS_CHILD, M + 12,  318, 70, ctlH, hwnd, (HMENU)ID_BTN_SWITCH1, NULL, NULL);
+            CreateWindowA("BUTTON", "Shift",
+                WS_VISIBLE | WS_CHILD, M + 90,  318, 70, ctlH, hwnd, (HMENU)ID_BTN_SWITCH2, NULL, NULL);
+            CreateWindowA("BUTTON", "无",
+                WS_VISIBLE | WS_CHILD, M + 168, 318, 70, ctlH, hwnd, (HMENU)ID_BTN_SWITCH3, NULL, NULL);
+            CreateWindowA("BUTTON", "无",
+                WS_VISIBLE | WS_CHILD, M + 246, 318, 70, ctlH, hwnd, (HMENU)ID_BTN_SWITCH4, NULL, NULL);
+            // 清空按钮推到最右，和四个槽位拉开距离，防误点。
+            CreateWindowA("BUTTON", "清空全部",
+                WS_VISIBLE | WS_CHILD, M + 468, 318, 100, ctlH, hwnd, (HMENU)ID_BTN_CLEAR_SWITCH, NULL, NULL);
+
+            // 组合键的生效方式：二选一。
+            // WS_GROUP 标在第一个上，把这两个单选按钮圈成一组，
+            // 否则它们会和窗口里其它单选按钮（目前没有）互相干扰。
+            CreateWindowA("BUTTON", "按下切换（按一下开、再按一下关）",
+                WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP,
+                M + 12, 352, 250, ctlH, hwnd, (HMENU)ID_RADIO_SWITCH_TOGGLE, NULL, NULL);
+            CreateWindowA("BUTTON", "按住生效（按下开、松开关）",
+                WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON,
+                M + 274, 352, 220, ctlH, hwnd, (HMENU)ID_RADIO_SWITCH_HOLD, NULL, NULL);
+
+            // ---------- 存档：从右侧栏挪到底部，变成一条横向工具栏 ----------
+            CreateWindowA("BUTTON", "存档",
+                WS_VISIBLE | WS_CHILD | BS_GROUPBOX,
+                M, 400, wideW, 86, hwnd, NULL, NULL, NULL);
+
+            // 下拉框：CBS_DROPDOWNLIST 禁止用户编辑文本，只能从列表中选择。
+            // 高度参数 200 是"收起高度 + 展开后列表高度"的总和，实际列表约 176px
+            // （约 8 行）。超过就自动出竖向滚动条，不会无限往下长；
+            // WS_VSCROLL 显式写上是为了让这个意图在代码里一眼可见。
             CreateWindowA("COMBOBOX", "",
                 WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
-                350, ry, 160, 200, hwnd, (HMENU)ID_COMBO_SAVE, NULL, NULL);
-            ry += 30;
+                M + 12, 422, 200, 200, hwnd, (HMENU)ID_COMBO_SAVE, NULL, NULL);
 
             CreateWindowA("BUTTON", "保存",
-                WS_VISIBLE | WS_CHILD,
-                350, ry, 70, 30, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL);
+                WS_VISIBLE | WS_CHILD, M + 224, 422, 80, ctlH, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL);
             CreateWindowA("BUTTON", "加载",
+                WS_VISIBLE | WS_CHILD, M + 312, 422, 80, ctlH, hwnd, (HMENU)ID_BTN_LOAD, NULL, NULL);
+
+            // 存档目录显示在组内，和存档操作放在一起，不用再往下找一行。
+            // SS_ENDELLIPSIS 让过长的路径自动变成省略号，不撑破分组框。
+            CreateWindowA("STATIC", "",
+                WS_VISIBLE | WS_CHILD | SS_ENDELLIPSIS,
+                M + 12, 454, wideW - 24, 18, hwnd, (HMENU)ID_STATIC_STATUS, NULL, NULL);
+
+            // ---------- 底部：快捷键提示 + 操作按钮（同一行） ----------
+            // 存档目录已经挪进"存档"分组框，这一行左边放提示、右边放三个按钮。
+            // 应用：把整份草稿推进内存，立刻生效，但不写盘。
+            // 重置：把整份草稿恢复成出厂默认。
+            // 退出：不看"最小化到托盘"设置，直接结束程序。
+            // 按钮右对齐，右边距 12，和左边距对称。
+            CreateWindowA("BUTTON", "应用", WS_VISIBLE | WS_CHILD,
+                336, 494, 80, 28, hwnd, (HMENU)ID_BTN_APPLY, NULL, NULL);
+            CreateWindowA("BUTTON", "重置", WS_VISIBLE | WS_CHILD,
+                424, 494, 80, 28, hwnd, (HMENU)ID_BTN_RESET, NULL, NULL);
+            CreateWindowA("BUTTON", "退出程序", WS_VISIBLE | WS_CHILD,
+                512, 494, 80, 28, hwnd, (HMENU)ID_BTN_EXIT, NULL, NULL);
+
+            // Esc+0 只在窗口前台有效（这个限制在钩子里判断，提示里不再写）
+            // 和三个按钮放在同一行：提示靠左、按钮靠右，底部只占一行。
+            CreateWindowA("STATIC", "重置快捷键：Esc + 0",
                 WS_VISIBLE | WS_CHILD,
-                430, ry, 70, 30, hwnd, (HMENU)ID_BTN_LOAD, NULL, NULL);
+                M, 500, 300, 18, hwnd, NULL, NULL, NULL);
 
             // ==================== 存档初始化 ====================
             // g_saveDir 已经在 WinMain 里定好了（正常 / 回退 / 只读三种模式），
             // 这里只按模式决定要不要碰磁盘，不再做目录探测。
+
+            // 先把草稿初始化成当前内存值（此刻就是出厂默认）。
+            // 必须放在读档之前：如果 save0 不存在，草稿也得是完整的，
+            // 否则之后点"应用"会把映射全推成 0。
+            DraftFromApplied();
+            g_dirty = false;
+
+            // 立刻按草稿刷一遍界面：单选按钮在创建时没有默认勾选，
+            // 不刷这一下会出现"两个都没选中"的状态。
+            RefreshUIFromDraft(hwnd);
+
             if (g_saveWritable) {
                 EnsureSaveDir();      // 只在可写时补建默认档
             } else {
@@ -1295,19 +1574,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 SetStatus(hwnd, "存档目录：" + g_saveDir);
             }
 
-            // 定时刷新按钮文字：兜底机制，防止某些极端情况下映射
-            // 发生了变化（比如被外部修改）而按钮文字没同步。
-            SetTimer(hwnd, ID_TIMER_REFRESH, 500, NULL);
-            break;
-        }
-
-        case WM_TIMER: {
-            if (wParam == ID_TIMER_REFRESH) {
-                // 只在"没有在等按键"的情况下刷新，避免把"按任意键..."覆盖掉。
-                if (waitingButtonId.load() == 0) {
-                    UpdateAllButtonText(hwnd);
-                }
-            }
+            // 按钮文字只在映射真正改变时刷新（捕获 / 清空 / 重置 / 加载），
+            // 不再靠 500ms 定时器兜底：那些原子量是本进程私有的，外部改不到，
+            // 而每条改动路径都已经主动刷过一次。
             break;
         }
 
@@ -1316,6 +1585,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             int id = LOWORD(wParam);
 
             switch (id) {
+                // ---------- 数值框内容改动：只置脏，不生效 ----------
+                // 改数字不会立刻影响手感，点"应用"才推进内存；写盘还要等"保存"。
+                // 程序自己 SetDlgItemInt 时也会触发 EN_CHANGE，用 g_updatingUI 挡掉。
+                case ID_EDIT_SPEED:
+                case ID_EDIT_SPEED_MUL:
+                case ID_EDIT_WHEEL_INTERVAL:
+                case ID_EDIT_WHEEL_SPEED:
+                case ID_EDIT_WHEEL_MUL:
+                case ID_EDIT_TICK:
+                    if (HIWORD(wParam) == EN_CHANGE && !g_updatingUI)
+                        g_dirty = true;
+                    break;
+
                 // ---------- 进入捕获模式：任何映射/组合键按钮点击均触发 ----------
                 case ID_BTN_KEY_UP:
                 case ID_BTN_KEY_DOWN:
@@ -1338,22 +1620,46 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
                 // ---------- 清空全部组合键 ----------
                 case ID_BTN_CLEAR_SWITCH: {
-                    switchKey1 = 0;
-                    switchKey2 = 0;
-                    switchKey3 = 0;
-                    switchKey4 = 0;
+                    // 只改草稿：界面立刻变成"无"，但实际组合键要等"应用"才失效。
+                    g_draft.switch1 = 0;
+                    g_draft.switch2 = 0;
+                    g_draft.switch3 = 0;
+                    g_draft.switch4 = 0;
+                    g_dirty = true;
                     UpdateAllButtonText(hwnd);
                     break;
                 }
 
+                // ---------- 组合键模式（两个单选按钮） ----------
+                // 只改草稿：模式本身也要点"应用"才生效，和其它设置走同一套规则。
+                case ID_RADIO_SWITCH_TOGGLE: {
+                    if (HIWORD(wParam) == BN_CLICKED) {
+                        g_draft.switchMode = 0;
+                        g_dirty = true;
+                    }
+                    break;
+                }
+
+                case ID_RADIO_SWITCH_HOLD: {
+                    if (HIWORD(wParam) == BN_CLICKED) {
+                        g_draft.switchMode = 1;
+                        g_dirty = true;
+                    }
+                    break;
+                }
+
                 // ---------- 两个布尔开关 ----------
+                // 同样只改草稿，点"应用"之后才真正影响行为
+                // （比如"最小化到托盘"要应用过才会在关窗时生效）。
                 case ID_CHECK_INTERCEPT: {
-                    interceptEnabled = (IsDlgButtonChecked(hwnd, ID_CHECK_INTERCEPT) == BST_CHECKED);
+                    g_draft.intercept = (IsDlgButtonChecked(hwnd, ID_CHECK_INTERCEPT) == BST_CHECKED);
+                    g_dirty = true;
                     break;
                 }
 
                 case ID_CHECK_TRAY: {
-                    isMinimizeToTray = (IsDlgButtonChecked(hwnd, ID_CHECK_TRAY) == BST_CHECKED);
+                    g_draft.tray = (IsDlgButtonChecked(hwnd, ID_CHECK_TRAY) == BST_CHECKED);
+                    g_dirty = true;
                     break;
                 }
 
@@ -1373,16 +1679,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
                 // ---------- 应用 / 重置 ----------
                 case ID_BTN_APPLY: {
-                    ApplyUIValues(hwnd);
+                    // 编辑框 → 草稿 → 内存，立刻生效。
+                    // 不写盘、也不清脏标记：磁盘上还是旧值，退出时仍该提示保存。
+                    ReadEditsIntoDraft(hwnd);
+                    ApplyDraft();
                     break;
                 }
 
                 case ID_BTN_RESET: {
-                    ResetUIValues(hwnd);
+                    ResetDraftAndUI(hwnd);
+                    break;
+                }
+
+                // ---------- 退出 ----------
+                // 刻意不看"最小化到托盘"：这个按钮的用途就是"真的退出"。
+                // 但仍走 QuitApp，有未保存的修改会先问一句，避免误点丢配置。
+                case ID_BTN_EXIT: {
+                    QuitApp(hwnd);
                     break;
                 }
 
                 // ---------- 保存 ----------
+                // 保存 = 应用 + 写所选存档 + 镜像写 save0。
                 case ID_BTN_SAVE: {
                     // 只读模式下按钮本来已置灰，这里再兜一层，防止消息伪造。
                     if (!g_saveWritable) {
@@ -1391,25 +1709,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                         break;
                     }
 
-                    // 读下拉框当前选中
-                    HWND hCombo = GetDlgItem(hwnd, ID_COMBO_SAVE);
-                    int sel = (int)SendMessageA(hCombo, CB_GETCURSEL, 0, 0);
-                    if (sel < 0) break;
-
-                    char name[256];
-                    SendMessageA(hCombo, CB_GETLBTEXT, sel, (LPARAM)name);
-
-                    // 如果是 "+"，走"新建存档"分支，不覆盖任何已有文件。
-                    if (strcmp(name, "+") == 0) {
+                    std::string slot = GetSelectedSlot(hwnd);
+                    if (slot.empty()) {
+                        // 选中的是 "+"：走新建分支，不覆盖任何已有文件。
                         PostMessageA(hwnd, WM_NEW_SAVE, 0, 0);
                         break;
                     }
 
-                    // 先把 UI 值写进变量，再存盘，避免"改完数字没点应用就保存"导致保存了旧值。
-                    ApplyUIValues(hwnd);
-                    if (SaveToFile(name)) {
-                        SetStatus(hwnd, "已保存：" + g_saveDir + "\\" + name + ".ini");
-                        MessageBoxA(hwnd, "保存成功", "提示", MB_OK);
+                    if (DoSave(hwnd, slot)) {
+                        SetStatus(hwnd, "已保存：" + g_saveDir + "\\" + slot + ".ini");
+                        MessageBoxA(hwnd, "保存成功（已同时更新默认存档 save0）", "提示", MB_OK);
                     } else {
                         // 不再无条件报"保存成功"：写不进去就要明确告诉用户。
                         SetStatus(hwnd, "保存失败：无法写入存档目录。");
@@ -1487,9 +1796,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
             // 简化处理：直接以第一个未占用的 saveN 命名新建存档，暂不提供命名对话框
             // 若用户希望自定义名字，可后续在此处插入输入框。
-            // 文件不存在时 SaveToFile 的第一次写入就会创建它，无需先 CreateSaveFile。
-            ApplyUIValues(hwnd);
-            SaveToFile(defaultName);
+            // 文件不存在时第一次写入就会创建它，无需先 CreateSaveFile。
+            if (!DoSave(hwnd, defaultName)) {
+                MessageBoxA(hwnd, "新建存档失败：无法写入存档目录。", "错误",
+                            MB_OK | MB_ICONERROR);
+                break;
+            }
             ScanSaveDir();
             FillComboBox(hwnd);
 
@@ -1506,7 +1818,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         // ---------- 重置快捷键（Esc+0，来自钩子） ----------
         case WM_RESET: {
-            ResetUIValues(hwnd);
+            // 和点"重置"按钮完全一样：只重置草稿并置脏，不自动应用、不写盘。
+            ResetDraftAndUI(hwnd);
             return 0;
         }
 
@@ -1525,13 +1838,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
             // 冲突校验：开关槽和映射槽不能共用同一个键。
             // 否则 ShouldIntercept 会把该键当"组合键成员"放行，映射就永久失效。
+            // 比对的是草稿：用户看到什么就按什么判定，不能拿"已生效"的旧值来比。
             bool isSwitchButton = (btnId >= ID_BTN_SWITCH1 && btnId <= ID_BTN_SWITCH4);
             bool conflict = isSwitchButton
-                ? (vk == keyUp.load() || vk == keyDown.load() || vk == keyLeft.load() ||
-                   vk == keyRight.load() || vk == keyLClick.load() || vk == keyRClick.load() ||
-                   vk == keyMClick.load() || vk == keyWheelUp.load() || vk == keyWheelDown.load())
-                : (vk == switchKey1.load() || vk == switchKey2.load() ||
-                   vk == switchKey3.load() || vk == switchKey4.load());
+                ? (vk == g_draft.keyUp || vk == g_draft.keyDown || vk == g_draft.keyLeft ||
+                   vk == g_draft.keyRight || vk == g_draft.keyLClick || vk == g_draft.keyRClick ||
+                   vk == g_draft.keyMClick || vk == g_draft.keyWheelUp || vk == g_draft.keyWheelDown)
+                : (vk == g_draft.switch1 || vk == g_draft.switch2 ||
+                   vk == g_draft.switch3 || vk == g_draft.switch4);
             if (conflict) {
                 MessageBoxA(hwnd, "该键已被另一种用途占用，请换一个键。", "按键冲突",
                             MB_OK | MB_ICONWARNING);
@@ -1540,35 +1854,37 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 return 0;
             }
 
-            // 根据当前捕获按钮，把新的 VK 码写入对应原子变量。
+            // 把新键写进草稿。注意：这里不直接改原子量，
+            // 所以"按了键但没点应用"时，旧键仍然是实际生效的那个。
             if (btnId == ID_BTN_KEY_UP){
-                keyUp = vk;
+                g_draft.keyUp = vk;
             }else if (btnId == ID_BTN_KEY_DOWN){
-                keyDown = vk;
+                g_draft.keyDown = vk;
             }else if (btnId == ID_BTN_KEY_LEFT){
-                keyLeft = vk;
+                g_draft.keyLeft = vk;
             }else if (btnId == ID_BTN_KEY_RIGHT){
-                keyRight = vk;
+                g_draft.keyRight = vk;
             }else if (btnId == ID_BTN_KEY_LCLICK){
-                keyLClick = vk;
+                g_draft.keyLClick = vk;
             }else if (btnId == ID_BTN_KEY_RCLICK){
-                keyRClick = vk;
+                g_draft.keyRClick = vk;
             }else if (btnId == ID_BTN_KEY_MCLICK){
-                keyMClick = vk;
+                g_draft.keyMClick = vk;
             }else if (btnId == ID_BTN_KEY_WHEELUP){
-                keyWheelUp = vk;
+                g_draft.keyWheelUp = vk;
             }else if (btnId == ID_BTN_KEY_WHEELDOWN){
-                keyWheelDown = vk;
+                g_draft.keyWheelDown = vk;
             }else if (btnId == ID_BTN_SWITCH1){
-                switchKey1 = vk;
+                g_draft.switch1 = vk;
             }else if (btnId == ID_BTN_SWITCH2){
-                switchKey2 = vk;
+                g_draft.switch2 = vk;
             }else if (btnId == ID_BTN_SWITCH3){
-                switchKey3 = vk;
+                g_draft.switch3 = vk;
             }else if (btnId == ID_BTN_SWITCH4){
-                switchKey4 = vk;
+                g_draft.switch4 = vk;
             }
 
+            g_dirty = true;   // 草稿变了，但还没应用、也没保存
             waitingButtonId = 0;
             UpdateAllButtonText(hwnd);
             return 0;
@@ -1579,23 +1895,38 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         // 不给出口就会一直卡在"按任意键..."（虽然 Esc 能取消，但不必要求用户知道）。
         // 不加超时：用户可能只是想慢慢按，超时反而会打断。
         case WM_ACTIVATE: {
-            if (LOWORD(wParam) == WA_INACTIVE && waitingButtonId.load() != 0) {
-                waitingButtonId = 0;
-                UpdateAllButtonText(hwnd);
+            if (LOWORD(wParam) == WA_INACTIVE) {
+                // 失焦时系统可能收不到 keyup（例如弹出 UAC 安全桌面、切换用户），
+                // 把自维护的 CapsLock 状态复位，免得组合键卡在"一直按着"。
+                capsDown = false;
+
+                if (waitingButtonId.load() != 0) {
+                    waitingButtonId = 0;
+                    UpdateAllButtonText(hwnd);
+                }
             }
             break;
         }
 
+        // ---------- 系统关机 / 注销 ----------
+        // 按约定：什么都不保存，也不弹窗，直接放行。
+        // 置标志是为了让随后可能到来的 WM_CLOSE 跳过"是否保存"的询问，
+        // 否则关机流程会卡在一个没人点的对话框上，拖住系统关机。
+        case WM_QUERYENDSESSION:
+            g_shuttingDown = true;
+            return TRUE;
+
         // ---------- 关闭窗口 ----------
         case WM_CLOSE: {
-            // 关闭前先"应用"一次 UI，保证关窗即保存用户最后的修改。
-            ApplyUIValues(hwnd);
-            if (isMinimizeToTray) {
+            // 判断用的是"已生效"的 isMinimizeToTray：勾选框只改草稿，
+            // 没点"应用"之前不算数。
+            if (isMinimizeToTray.load() && !g_shuttingDown) {
                 // 走托盘：隐藏窗口 + 添加图标；进程继续运行。
+                // 隐藏不等于退出，所以不询问保存。
                 ShowWindow(hwnd, SW_HIDE);
                 AddTrayIcon(hwnd);
             } else {
-                // 非托盘：走统一退出入口，先收值再写 save0 再销毁。
+                // 真正退出：有未保存的修改会弹 是/否/取消。
                 QuitApp(hwnd);
             }
             return 0;
@@ -1626,7 +1957,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     RemoveTrayIcon();
                 } else if (cmd == 2) {
                     RemoveTrayIcon();
-                    // 托盘"退出"同样走 QuitApp，否则会绕过 ApplyUIValues 丢修改。
+                    // 托盘"退出"也走 QuitApp：同样会询问是否保存未应用的修改。
                     QuitApp(hwnd);
                 }
             }
@@ -1635,10 +1966,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         // ---------- 销毁：全局收尾 ----------
         case WM_DESTROY:
-            KillTimer(hwnd, ID_TIMER_REFRESH);
             RemoveTrayIcon();
-            // save0 已在 QuitApp 里写过；这里不再重复写，
-            // 否则会在控件已销毁后再用旧值覆盖一次。
+            // 这里不再隐式写 save0：保存只发生在用户点"保存"，
+            // 或在退出提示里选"是"的时候。
             isRunning = false;     // 让控制线程尽快跳出 while
             PostQuitMessage(0);    // 结束消息泵
             return 0;
@@ -1679,11 +2009,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
 
-    // 窗口宽度 530 是为了让右侧存档区放得下；高度 720 容纳全部控件。
+    // 新布局：顶部开关组 + 左右两栏 + 开关组合键 + 存档组 + 单行操作行，640×580。
+    // 因为布局是绝对坐标、没有处理 WM_SIZE，所以去掉可拖动边框和最大化按钮，
+    // 免得用户把窗口拉大后控件全挤在左上角。
     HWND hwnd = CreateWindowExA(
         0, "MyClass", "光标控制 [启用]",
-        WS_OVERLAPPEDWINDOW,
-        100, 100, 530, 720,   // 宽度 480 → 530
+        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
+        100, 100, 640, 580,
         NULL, NULL, hInst, NULL
     );
 
