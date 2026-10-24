@@ -108,7 +108,7 @@ std::atomic<int> TICK_MS(DEFAULT_TICK_MS);
 // 这些值既被 UI 线程修改，也被控制线程读取，因此用 atomic。
 // （本例中都是 int，读写本身是原子的，但使用 atomic 可以保证
 //   修改立刻对其它线程可见，且不对齐问题被规避。）
-std::atomic<int> MOVE_SPEED(2);           // 每帧移动的像素数
+std::atomic<double> MOVE_SPEED(2.0);      // 每帧移动的像素数，允许小数（0.1~100）
 std::atomic<int> SPEED_MULTIPLIER(3);     // 按住 Shift 时的速度倍率
 std::atomic<int> WHEEL_INTERVAL(80);      // 两次滚轮事件的最小间隔（ms）
 std::atomic<int> WHEEL_SPEED(1);          // 每次滚动的"档位"数
@@ -186,7 +186,8 @@ bool g_backupBeforeSave = false;        // 读档失败过：下次保存前先�
 // 原子量（真正生效），"保存"再落盘。
 // 这样"没点应用就不生效、没点保存就不落盘"的语义才成立。
 struct ConfigDraft {
-    int moveSpeed, speedMul, wheelInterval, wheelSpeed, wheelMul;   // 5 个速度数值
+    double moveSpeed;                                               // 移动速度（可带小数）
+    int speedMul, wheelInterval, wheelSpeed, wheelMul;              // 其余 4 个速度数值
     int tickMs;                                                     // 刷新间隔（毫秒）
     int keyUp, keyDown, keyLeft, keyRight;                          // 4 个移动键
     int keyLClick, keyRClick, keyMClick;                            // 3 个鼠标键
@@ -486,7 +487,7 @@ void FillComboBox(HWND hwnd) {
 // ==================== 草稿 / 应用 ====================
 // 出厂默认值。重置按钮、以及"启动时没有存档"的初始草稿都用它。
 void DraftDefaults() {
-    g_draft.moveSpeed     = 2;
+    g_draft.moveSpeed     = 2.0;
     g_draft.speedMul      = 3;
     g_draft.wheelInterval = 80;
     g_draft.wheelSpeed    = 1;
@@ -574,6 +575,19 @@ void ApplyDraft() {
     isMinimizeToTray = g_draft.tray;
 }
 
+// 把速度格式化成紧凑字符串：2 而不是 2.000000，2.5 而不是 2.500000。
+// 保存、界面显示共用这一套格式，保证"写进去的字符串"和"读回来的"完全一致。
+std::string FormatSpeed(double v) {
+    char buf[32];
+    sprintf_s(buf, "%.6f", v);
+    std::string s = buf;
+    if (s.find('.') != std::string::npos) {
+        while (!s.empty() && s[s.size() - 1] == '0') s.erase(s.size() - 1);
+        if (!s.empty() && s[s.size() - 1] == '.') s.erase(s.size() - 1);
+    }
+    return s;
+}
+
 // 把 5 个编辑框的内容读进草稿。
 // 带范围钳制：空、非数字、越界一律忽略，并把编辑框改回草稿里的有效值，
 // 避免出现"框里显示空、实际保存的是旧值"这种对不上的情况。
@@ -583,10 +597,12 @@ void ReadEditsIntoDraft(HWND hwnd) {
     char buf[32];
     int v;
 
+    // 移动速度是唯一允许小数的项：0.1~100，用 atof 解析；
+    // 非法输入（空、字母、越界）回写草稿里的原值。
     GetDlgItemTextA(hwnd, ID_EDIT_SPEED, buf, 32);
-    v = atoi(buf);
-    if (v >= 1 && v <= 100) g_draft.moveSpeed = v;
-    else SetDlgItemInt(hwnd, ID_EDIT_SPEED, g_draft.moveSpeed, FALSE);
+    double spd = atof(buf);
+    if (spd >= 0.1 && spd <= 100.0) g_draft.moveSpeed = spd;
+    else SetDlgItemTextA(hwnd, ID_EDIT_SPEED, FormatSpeed(g_draft.moveSpeed).c_str());
 
     GetDlgItemTextA(hwnd, ID_EDIT_SPEED_MUL, buf, 32);
     v = atoi(buf);
@@ -624,7 +640,8 @@ void ReadEditsIntoDraft(HWND hwnd) {
 void RefreshUIFromDraft(HWND hwnd) {
     g_updatingUI = true;
 
-    SetDlgItemInt(hwnd, ID_EDIT_SPEED, g_draft.moveSpeed, FALSE);
+    // 速度可带小数，不能用 SetDlgItemInt
+    SetDlgItemTextA(hwnd, ID_EDIT_SPEED, FormatSpeed(g_draft.moveSpeed).c_str());
     SetDlgItemInt(hwnd, ID_EDIT_SPEED_MUL, g_draft.speedMul, FALSE);
     SetDlgItemInt(hwnd, ID_EDIT_WHEEL_INTERVAL, g_draft.wheelInterval, FALSE);
     SetDlgItemInt(hwnd, ID_EDIT_WHEEL_SPEED, g_draft.wheelSpeed, FALSE);
@@ -677,8 +694,10 @@ bool SaveToFile(const std::string& name) {
 
     char buf[32];
 
-    sprintf_s(buf, "%d", MOVE_SPEED.load());
-    WritePrivateProfileStringA("Speed", "MOVE_SPEED", buf, path.c_str());
+    // 移动速度可能带小数，用 FormatSpeed 统一格式；
+    // speedStr 留到函数末尾做读回校验。
+    std::string speedStr = FormatSpeed(MOVE_SPEED.load());
+    WritePrivateProfileStringA("Speed", "MOVE_SPEED", speedStr.c_str(), path.c_str());
     sprintf_s(buf, "%d", SPEED_MULTIPLIER.load());
     WritePrivateProfileStringA("Speed", "SPEED_MULTIPLIER", buf, path.c_str());
     sprintf_s(buf, "%d", WHEEL_INTERVAL.load());
@@ -734,7 +753,10 @@ bool SaveToFile(const std::string& name) {
         isMinimizeToTray.load() ? "1" : "0", path.c_str());
 
     // 抽样复核：API 返回成功不代表真写进去了（磁盘满、被占用等）。
-    return GetPrivateProfileIntA("Speed", "MOVE_SPEED", -1, path.c_str()) == MOVE_SPEED.load();
+    // 比的是"写进去的字符串"和"读回来的字符串"，避开浮点相等的坑。
+    char verify[32] = {};
+    GetPrivateProfileStringA("Speed", "MOVE_SPEED", "", verify, 32, path.c_str());
+    return speedStr == verify;
 }
 
 // 读档结果
@@ -759,7 +781,13 @@ LoadResult LoadFromFile(const std::string& name) {
     }
 
     // 缺省值使用程序的"出厂默认"，这样即便存档缺失/损坏也能保持可用。
-    MOVE_SPEED = GetPrivateProfileIntA("Speed", "MOVE_SPEED", 2, path.c_str());
+    // 移动速度允许小数：atof 解析后钳到 0.1~100，防止 ini 被手改成 0 或负数。
+    char speedBuf[32] = {};
+    GetPrivateProfileStringA("Speed", "MOVE_SPEED", "2", speedBuf, 32, path.c_str());
+    double spd = atof(speedBuf);
+    if (spd < 0.1) spd = 0.1;
+    if (spd > 100.0) spd = 100.0;
+    MOVE_SPEED = spd;
     SPEED_MULTIPLIER = GetPrivateProfileIntA("Speed", "SPEED_MULTIPLIER", 3, path.c_str());
     WHEEL_INTERVAL = GetPrivateProfileIntA("Speed", "WHEEL_INTERVAL", 80, path.c_str());
     WHEEL_SPEED = GetPrivateProfileIntA("Speed", "WHEEL_SPEED", 1, path.c_str());
@@ -1085,6 +1113,10 @@ void MouseControlThread() {
     bool lastToggleState = false;   // 上一轮的组合键状态，用于"边沿"识别
     auto lastWheelTime = steady_clock::now();   // 滚轮节流（限速）的时间戳
 
+    // 亚像素余量：速度可以是小数，但 SetCursorPos 只收整数。
+    // 每帧把带小数的位移累加进来，只走整数部分，小数留到下一帧。
+    double accX = 0.0, accY = 0.0;
+
     TickTimer timer;
     if (timer.coarse) timeBeginPeriod(1);   // 老系统：普通定时器精度不够
 
@@ -1159,16 +1191,24 @@ void MouseControlThread() {
         // ---------- 速度 ----------
         // 用 SetCursorPos 而不是 SendInput：SetCursorPos 是精确设置位置，
         // 在 Windows 下不会被 Clipping 等机制干扰，对"移动"意图更直接。
+        // 速度可以是小数（比如 0.5）：累加进 accX/accY，只走整数像素，
+        // 余量留到下一帧，于是 0.5 就表现为"每两帧走 1 像素"。
         if (e || s || d || f) {
             POINT pt;
             GetCursorPos(&pt);
-            int speed = MOVE_SPEED.load();
-            if (keyShift.load()) speed *= SPEED_MULTIPLIER.load();
-            if (e) pt.y -= speed;
-            if (d) pt.y += speed;
-            if (s) pt.x -= speed;
-            if (f) pt.x += speed;
-            SetCursorPos(pt.x, pt.y);
+
+            double v = MOVE_SPEED.load();
+            if (keyShift.load()) v *= SPEED_MULTIPLIER.load();
+
+            if (e) accY -= v;
+            if (d) accY += v;
+            if (s) accX -= v;
+            if (f) accX += v;
+
+            int dx = (int)accX;  accX -= dx;
+            int dy = (int)accY;  accY -= dy;
+
+            SetCursorPos(pt.x + dx, pt.y + dy);
         }
 
         // ---------- 三键点击 ----------
@@ -1397,8 +1437,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
             CreateWindowA("STATIC", "移动速度:",
                 WS_VISIBLE | WS_CHILD, sx, 106 + 3, 90, 18, hwnd, NULL, NULL, NULL);
+            // 移动速度允许小数，所以不能加 ES_NUMBER —— 它会把 '.' 也拦掉。
+            // 非法输入由 ReadEditsIntoDraft 回退，不靠控件限制。
             CreateWindowA("EDIT", "2",
-                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                WS_VISIBLE | WS_CHILD | WS_BORDER,
                 vx, 106, 64, 22, hwnd, (HMENU)ID_EDIT_SPEED, NULL, NULL);
 
             CreateWindowA("STATIC", "Shift加速:",
