@@ -1,10 +1,10 @@
-# 这个介绍过期了
-
 ## 编译
 
 ```powershell
 g++ -std=c++11 -O2 -s -mwindows -static -pthread -fexec-charset=GBK KeyboardCursor.cpp -o KeyboardCursor.exe -lwinmm -lgdi32 -luser32 -lshell32
 ```
+
+# 这个介绍过期了
 
 
 # 🖱️ 光标控制程序 / Cursor Control Program
